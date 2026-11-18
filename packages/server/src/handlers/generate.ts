@@ -70,7 +70,7 @@ export const GenerateHandler = HttpApiBuilder.group(Api, "server.generate", (han
         yield* videoEnabled
         yield* awaitPlugins
         return {
-          data: yield* videos.start(VideoGeneration.fromRequest(request.payload)).pipe(Effect.mapError(generateError)),
+          data: yield* videos.start(Generate.videoInput(request.payload)).pipe(Effect.mapError(generateError)),
         }
       },
       Effect.provide(services),
