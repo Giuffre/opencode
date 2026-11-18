@@ -522,3 +522,152 @@ fn a_tool_can_interrupt_its_run() {
         ]
     );
 }
+
+/// A runtime whose tools, extension function and hooks record whether they ran on the thread that drives the run.
+fn thread_witness(driver: std::thread::ThreadId, strays: &Arc<AtomicUsize>) -> Runtime {
+    let check = {
+        let strays = strays.clone();
+        move || {
+            if std::thread::current().id() != driver {
+                strays.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    };
+    let (sync, slow, ext, before, after) = (
+        check.clone(),
+        check.clone(),
+        check.clone(),
+        check.clone(),
+        check,
+    );
+    Runtime::new()
+        .with_tool(
+            "sync",
+            Tool::new("Sync", move |input, _| {
+                sync();
+                Ok(input)
+            })
+            .output(any()),
+        )
+        .with_tool(
+            "slow",
+            Tool::new_async("Slow", move |input, _| {
+                let slow = slow.clone();
+                async move {
+                    slow();
+                    Ok(later(5, input).await)
+                }
+            })
+            .output(any()),
+        )
+        .extension(Extension::new("witness").function(
+            "witness",
+            HostFunction::new("witness", 1, move |args| {
+                ext();
+                Ok(args.into_iter().next().unwrap_or_default())
+            }),
+        ))
+        .hooks(
+            Hooks::new()
+                .tool_before(move |_| {
+                    before();
+                    Ok(())
+                })
+                .tool_after(move |_, _| after()),
+        )
+}
+
+/// Computes for a while, then calls every kind of host code, then computes again.
+const BUSY_THEN_HOST: &str = "
+    const spin = (k) => { let n = 0; for (let i = 0; i < k; i++) n += i % 7; return n > 0 }
+    const a = spin(2e6)
+    const b = await tools.sync(1)
+    const c = witness(2)
+    const d = await tools.slow(3)
+    const e = await Promise.all([tools.sync(4), tools.slow(5)])
+    return [a, b, c, d, e, spin(1e6)]";
+
+#[test]
+fn long_compute_leaves_the_executor_while_host_code_stays_on_it() {
+    let strays = Arc::new(AtomicUsize::new(0));
+    let rt = thread_witness(std::thread::current().id(), &strays);
+    let bindings = serde_json::Map::new();
+    let started = Instant::now();
+    let blocking = rt.execute(BUSY_THEN_HOST, &bindings);
+    let whole = started.elapsed();
+    let mut run = Box::pin(rt.execute_async(BUSY_THEN_HOST, &bindings));
+    let started = Instant::now();
+    let first = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    assert!(first.is_pending());
+    assert!(
+        started.elapsed() < whole / 4,
+        "the first poll held the executor for {:?} of {whole:?}",
+        started.elapsed()
+    );
+    let outcome = drive(run).unwrap();
+    assert_eq!(
+        outcome.result.unwrap(),
+        json!([true, 1, 2, 3, [4, 5], true])
+    );
+    assert_eq!(strays.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        blocking.result.unwrap(),
+        json!([true, 1, 2, 3, [4, 5], true])
+    );
+}
+
+#[test]
+fn dropping_a_run_away_on_its_worker_ends_it_here() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let rt = Runtime::new()
+        .with_tool(
+            "never",
+            Tool::new_async("Never", |_, _| std::future::pending()).input(empty()),
+        )
+        .hooks(observe(&events));
+    let bindings = serde_json::Map::new();
+    let mut run = Box::pin(rt.execute_async("tools.never({}); while (true) {}", &bindings));
+    let waker = Waker::noop();
+    assert!(
+        run.as_mut()
+            .poll(&mut Context::from_waker(waker))
+            .is_pending()
+    );
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(
+        run.as_mut()
+            .poll(&mut Context::from_waker(waker))
+            .is_pending()
+    );
+    drop(run);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            r#"tool.before {"name":"never","input":{}}"#,
+            "tool.after never interrupted"
+        ]
+    );
+}
+
+#[test]
+fn a_run_away_on_its_worker_suspends_and_resumes() {
+    let rt = Runtime::new();
+    let code = "let n = 0; for (let i = 0; i < 2e9; i++) n++; return n > 0";
+    let program = rt.program(code, &serde_json::Map::new(), None);
+    let suspender = program.suspender();
+    let mut run = Box::pin(program.run_resumable_async());
+    assert!(
+        run.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let asked = std::thread::spawn(move || suspender.suspend(None));
+    let outcome = drive(run).unwrap();
+    let answer = asked.join().unwrap().unwrap();
+    let (psychoscript::RunOutcome::Suspended(state), psychoscript::RunOutcome::Suspended(_)) =
+        (outcome, answer)
+    else {
+        panic!("expected a suspended run");
+    };
+    assert!(rt.resume(&state.state).is_ok());
+}

@@ -203,6 +203,11 @@ pub struct RunHost {
     pub(crate) meter: Meter,
     /// Set while a carrier result (`HostFunction::carrier`) crosses in.
     pub(crate) carrier: bool,
+    /// Where host code runs while the run computes on a worker thread.
+    pub(crate) home: Option<crate::offload::Home>,
+    /// When the stretch of compute in progress has run long enough to move to a worker thread, and whether it has.
+    pub(crate) offload_at: Option<std::time::Instant>,
+    pub(crate) offload_due: bool,
 }
 
 /// The reference's fuel left (`handover`) and the steps left until the VM next checks the clock (`fuel`), as of when
@@ -246,6 +251,9 @@ impl RunHost {
             namespaces: FxHashMap::default(),
             epoch: Default::default(),
             carrier: false,
+            home: None,
+            offload_at: None,
+            offload_due: false,
             meter: Meter {
                 start: crate::vm::HANDOVER_FUEL,
                 handover: crate::vm::HANDOVER_FUEL,
@@ -427,7 +435,15 @@ pub(crate) fn start_tool(vm: &mut Vm, p: Id, path: &str, args: Vec<Option<Json>>
     {
         let shared = vm.host.shared.clone();
         shared.enter_sync(&vm.host, admitted.call, tool_expression(path));
-        let raw = f(admitted.input, vm.host.sync_context(admitted.call));
+        let raw = match vm.host.home.clone() {
+            None => f(admitted.input, vm.host.sync_context(admitted.call)),
+            Some(home) => {
+                let (f, ctx) = (f.clone(), vm.host.sync_context(admitted.call).clone());
+                let input = admitted.input;
+                home.run(move || f(input, &ctx))
+                    .unwrap_or_else(|| Err(crate::ToolError::interrupt()))
+            }
+        };
         shared.leave_sync();
         let s = finish(path, &admitted.tool, raw);
         if let Settlement::Interrupted = s {
@@ -493,7 +509,7 @@ pub fn spawn_tool(
         phase,
         start,
     ));
-    match vm.host.tasks.spawn(p, future) {
+    match vm.host.tasks.spawn(p, future, vm.host.home.as_ref()) {
         Poll::Ready(s) => vm.inbox.push_back((p, s)),
         Poll::Pending => vm.host.calls.push(Call {
             promise: p,
@@ -1476,7 +1492,6 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
         )?);
     }
     let setup = vm.host.setup.clone();
-    let hooks = &setup.hooks;
     let invocation = hooked.then(|| ExtensionInvocation {
         extension,
         name: label.clone(),
@@ -1487,19 +1502,38 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
             let shared = vm.host.shared.clone();
             let call_id = vm.host.next_call();
             shared.enter_sync(&vm.host, call_id, label.clone());
-            if let (Some(call), Some(before)) = (&invocation, &hooks.extension_before)
-                && let Err(e) = block_on(before(call))
-            {
-                shared.leave_sync();
-                let thrown = HostValue::Error(Box::new(e));
-                return Err(from_host(vm, &thrown, &label, None, 0).unwrap_or_else(|e| e));
-            }
-            let result = body(host_args);
+            let (body, setup) = (body.clone(), setup.clone());
+            let host_call = move || {
+                let hooks = &setup.hooks;
+                if let (Some(call), Some(before)) = (&invocation, &hooks.extension_before)
+                    && let Err(e) = block_on(before(call))
+                {
+                    return Err(e);
+                }
+                let result = body(host_args);
+                if let (Some(call), Some(after)) = (&invocation, &hooks.extension_after) {
+                    report(after.as_ref(), call, &result);
+                }
+                Ok(result)
+            };
+            let called = match vm.host.home.clone() {
+                None => Some(host_call()),
+                Some(home) => home.run(host_call),
+            };
             shared.leave_sync();
+            let result = match called {
+                Some(Ok(result)) => result,
+                Some(Err(e)) => {
+                    let thrown = HostValue::Error(Box::new(e));
+                    return Err(from_host(vm, &thrown, &label, None, 0).unwrap_or_else(|e| e));
+                }
+                // The run is being dropped.
+                None => {
+                    interrupt(vm);
+                    return Err(Value::Undef);
+                }
+            };
             vm.host.next_epoch();
-            if let (Some(call), Some(after)) = (&invocation, &hooks.extension_after) {
-                report(after.as_ref(), call, &result);
-            }
             match result {
                 Ok(v) => result_from_host(vm, v, &label, &extension_name),
                 Err(thrown) => Err(from_host(vm, &thrown, &label, None, 0).unwrap_or_else(|e| e)),
@@ -1533,7 +1567,7 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
                 guard.end(&result);
                 Settlement::Host(Box::new((result, label, extension_name, carrier)))
             });
-            match vm.host.tasks.spawn(p, future) {
+            match vm.host.tasks.spawn(p, future, vm.host.home.as_ref()) {
                 Poll::Ready(s) => vm.inbox.push_back((p, s)),
                 Poll::Pending => vm.host.calls.push(Call {
                     promise: p,

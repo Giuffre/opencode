@@ -28,7 +28,7 @@ pub const COMPILE_STACK_PER_LEVEL: usize = if cfg!(debug_assertions) {
 /// where a program runs never changes what it can do. A run on the caller's thread assumes this much is free there.
 pub const RUN_STACK_BUDGET: usize = 512 << 10;
 /// Room on a compiling thread beyond what the program's nesting needs.
-const THREAD_STACK_BASE: usize = 256 << 10;
+pub(crate) const THREAD_STACK_BASE: usize = 256 << 10;
 
 pub fn execute(rt: &Runtime, code: &str, bindings: &serde_json::Map<String, Json>) -> Outcome {
     let run = AssertUnwindSafe(|| settled(rt.program(code, bindings, None).run()));

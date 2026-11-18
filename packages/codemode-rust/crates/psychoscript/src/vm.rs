@@ -880,6 +880,16 @@ impl Vm {
             self.host.meter.fuel = self.roundtrip_every as i32;
             self.suspend_wanted = true;
         }
+        // A long stretch of compute stops to move to a worker thread: see `offload`.
+        if self
+            .host
+            .offload_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            self.host.offload_at = None;
+            self.host.offload_due = true;
+            self.suspend_wanted = true;
+        }
         if self
             .host
             .shared

@@ -21,6 +21,7 @@ mod iteration;
 mod native;
 mod nesting;
 mod object;
+mod offload;
 pub mod openapi;
 mod ops;
 mod program;

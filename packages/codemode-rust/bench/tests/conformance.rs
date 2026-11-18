@@ -1,6 +1,7 @@
 //! Runs every `conformance/cases/<name>.js` through `psychoscript::Runtime` and compares it with the reference outcome
 //! in `<name>.json`. Reports every failing case at once. `CONFORMANCE_FILTER=<substring>` narrows the run. A case
-//! with a `// @platform "<os>"` header is checked only on that OS, where `conformance/generate.ts` records it.
+//! with a `// @platform "<os>"` header is checked only on that OS, where `conformance/generate.ts` records it. Every
+//! case runs twice: blocking, and as a future, where a long stretch of compute continues on a worker thread.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -62,7 +63,7 @@ fn same(a: &Json, b: &Json) -> bool {
     }
 }
 
-fn check(name: &str, code: &str, expected: &Json) -> Result<(), String> {
+fn check(name: &str, code: &str, expected: &Json, future: bool) -> Result<(), String> {
     let bindings = expected["bindings"]
         .as_object()
         .cloned()
@@ -73,16 +74,33 @@ fn check(name: &str, code: &str, expected: &Json) -> Result<(), String> {
         max_output_bytes: None,
     };
     let rt = runtime(limits);
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| rt.execute(code, &bindings))).map_err(
-        |payload| {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                .unwrap_or_default();
-            format!("{name}: panicked: {msg}")
-        },
-    )?;
+    let run = || {
+        if future {
+            return drive(rt.execute_async(code, &bindings)).unwrap_or_else(|i| {
+                psychoscript::Outcome {
+                    result: Err(psychoscript::Diagnostic {
+                        kind: psychoscript::DiagnosticKind::ExecutionFailure,
+                        message: i.to_string(),
+                        location: None,
+                        suggestions: Vec::new(),
+                    }),
+                    warnings: Vec::new(),
+                    logs: Vec::new(),
+                    truncated: false,
+                    tool_calls: Vec::new(),
+                }
+            });
+        }
+        rt.execute(code, &bindings)
+    };
+    let outcome = panic::catch_unwind(AssertUnwindSafe(run)).map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        format!("{name}: panicked: {msg}")
+    })?;
 
     let mut problems = Vec::new();
     match (&outcome.result, expected["ok"].as_bool()) {
@@ -166,7 +184,13 @@ fn conformance() {
                 &std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap(),
             )
             .unwrap();
-            check(name, &code, &expected).err()
+            let mut problems = check(name, &code, &expected, false).err();
+            if problems.is_none() {
+                problems = check(name, &code, &expected, true)
+                    .err()
+                    .map(|p| format!("as a future: {p}"));
+            }
+            problems
         })
         .collect();
     panic::set_hook(hook);
@@ -180,4 +204,27 @@ fn conformance() {
         );
     }
     println!("{} conformance cases passed", names.len());
+}
+
+/// Polls a future to its end on this thread, parking until it is woken.
+fn drive<F: std::future::Future>(future: F) -> F::Output {
+    struct Flag(std::sync::atomic::AtomicBool, std::thread::Thread);
+    impl std::task::Wake for Flag {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.1.unpark();
+        }
+    }
+    let flag = std::sync::Arc::new(Flag(false.into(), std::thread::current()));
+    let waker = std::task::Waker::from(flag.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        while !flag.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            std::thread::park();
+        }
+    }
 }
