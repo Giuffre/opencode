@@ -610,7 +610,7 @@ fn collect_map(vm: &mut Vm, fr: Frame, k: usize) -> Result<Step, Value> {
     fr.call_slots(vm, f, this_arg, [Slot::pack(v), Slot::index(k)])
 }
 
-fn values_of<'a>(vm: &'a Vm, s: Slot) -> &'a [Value] {
+fn values_of(vm: &Vm, s: Slot) -> &[Value] {
     match s.obj().map(|o| &vm.heap[o as usize].kind) {
         Some(Kind::Array(values)) => values,
         _ => &[],
