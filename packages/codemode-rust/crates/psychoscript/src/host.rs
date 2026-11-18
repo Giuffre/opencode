@@ -917,25 +917,47 @@ fn run_search(vm: &mut Vm, args: &[Option<Json>]) -> Result<Json, Box<Failed>> {
     let key = ctx.key();
     let shared = vm.host.shared.clone();
     shared.enter_sync(&vm.host, ctx.call, "search".into());
-    let hooks = &setup.hooks;
     let call = ToolInvocation {
         name: "search".into(),
         input: input.clone(),
         key,
     };
-    if let Some(before) = &hooks.tool_before
-        && let Err(e) = block_on(before(&call))
-    {
+    // The hooks are host code: while the run is on its worker, they run where it is driven.
+    let home = crate::offload::home(&vm.host.offload).cloned();
+    let before = {
+        let (setup, call) = (setup.clone(), call.clone());
+        on_home(home.as_ref(), move || match &setup.hooks.tool_before {
+            Some(before) => block_on(before(&call)).err(),
+            None => None,
+        })
+    };
+    if let Some(e) = before.flatten() {
         shared.leave_sync();
         return Err(Failed::new(DiagnosticKind::ToolFailure, e.message));
     }
     let registry = &setup.registry;
     let result = search::search(registry.entries(), registry.word_index(), &input);
     shared.leave_sync();
-    if let Some(after) = &hooks.tool_after {
-        after(&call, CallResult::Success(&result));
+    if setup.hooks.tool_after.is_some() {
+        let (setup, found) = (setup.clone(), result.clone());
+        on_home(home.as_ref(), move || {
+            if let Some(after) = &setup.hooks.tool_after {
+                after(&call, CallResult::Success(&found));
+            }
+        });
     }
     Ok(result)
+}
+
+/// Runs host code `f` where the run is driven: here, or back from its worker. `None` when the run is being dropped.
+fn on_home<R: Send + 'static>(
+    home: Option<&crate::offload::Home>,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    match home {
+        None => Some(f()),
+        Some(home) => home.run(f),
+    }
 }
 
 /// The prototype of `search` results: an ordinary object whose `then`, `catch` and `finally` act on a settled copy,

@@ -585,7 +585,8 @@ const BUSY_THEN_HOST: &str = "
     const c = witness(2)
     const d = await tools.slow(3)
     const e = await Promise.all([tools.sync(4), tools.slow(5)])
-    return [a, b, c, d, e, spin(1e6)]";
+    const f = spin(2e6) && search('sync').items.length > 0
+    return [a, b, c, d, e, spin(1e6), f]";
 
 #[test]
 fn long_compute_leaves_the_executor_while_host_code_stays_on_it() {
@@ -607,12 +608,12 @@ fn long_compute_leaves_the_executor_while_host_code_stays_on_it() {
     let outcome = drive(run).unwrap();
     assert_eq!(
         outcome.result.unwrap(),
-        json!([true, 1, 2, 3, [4, 5], true])
+        json!([true, 1, 2, 3, [4, 5], true, true])
     );
     assert_eq!(strays.load(Ordering::SeqCst), 0);
     assert_eq!(
         blocking.result.unwrap(),
-        json!([true, 1, 2, 3, [4, 5], true])
+        json!([true, 1, 2, 3, [4, 5], true, true])
     );
 }
 
