@@ -520,6 +520,12 @@ fn restore<'a>(
     Ok(r)
 }
 
+// A run's state may move to another thread between steps.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Running<'static>>()
+};
+
 impl<'a> Running<'a> {
     pub fn new(vm: Vm<'a>, code: Cow<'a, str>) -> Self {
         Self {

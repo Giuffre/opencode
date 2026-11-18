@@ -1,6 +1,6 @@
 //! Heap objects, property storage and the atom interner.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -112,8 +112,8 @@ pub struct Failure {
 }
 
 pub struct Closure {
-    pub proto: Rc<FuncProto>,
-    pub upvals: Rc<[u32]>,
+    pub proto: Arc<FuncProto>,
+    pub upvals: Arc<[u32]>,
     pub this: Value,
 }
 
@@ -306,10 +306,10 @@ pub enum Kind {
         pos: u32,
     },
     ListIter {
-        items: Rc<[Value]>,
+        items: Arc<[Value]>,
         pos: u32,
     },
-    ToolRef(Rc<str>),
+    ToolRef(Arc<str>),
     /// Shared state of a promise's resolve/reject pair: the promise, and whether either already ran.
     Resolvers {
         promise: Id,

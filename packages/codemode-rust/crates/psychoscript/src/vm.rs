@@ -1,7 +1,7 @@
 //! The stack machine: frames, calls, exceptions, suspension and the run loop.
 
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
@@ -63,10 +63,10 @@ pub enum Resume {
 }
 
 pub struct Frame {
-    pub func: Rc<FuncProto>,
+    pub func: Arc<FuncProto>,
     pub pc: usize,
     pub base: usize,
-    pub upvals: Rc<[u32]>,
+    pub upvals: Arc<[u32]>,
     /// Where this frame's exception handlers start in `Vm::handlers`.
     pub hbase: u32,
     /// Arguments beyond the declared parameters, kept for rest parameters and `arguments`.
@@ -242,14 +242,14 @@ pub struct Vm<'rt> {
     templates: Vec<TemplateSite>,
     /// Each tagged template site's strings array, once made.
     template_objs: Vec<Option<Id>>,
-    pub protos: Vec<Rc<FuncProto>>,
+    pub protos: Vec<Arc<FuncProto>>,
     pub jobs: VecDeque<Job>,
     pub inbox: VecDeque<(Id, ToolOutcome)>,
     pub coroutines: Vec<Coroutine>,
     pub logs: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub host: crate::host::RunHost<'rt>,
-    pub tool_refs: FxHashMap<Rc<str>, Id>,
+    pub tool_refs: FxHashMap<Arc<str>, Id>,
     pub limits: Limits,
     pub start: Instant,
     /// Steps left before `budget_out`: the nearer of the reference's fuel and this VM's own check of the clock and of
@@ -1415,7 +1415,7 @@ impl<'rt> Vm<'rt> {
             return Value::Obj(*id);
         }
         let proto = self.realm.function_proto;
-        let rc: Rc<str> = Rc::from(path);
+        let rc: Arc<str> = Arc::from(path);
         let id = self.alloc(Obj::new(Some(proto), Kind::ToolRef(rc.clone())));
         self.tool_refs.insert(rc, id);
         Value::Obj(id)
@@ -2435,7 +2435,7 @@ impl<'rt> Vm<'rt> {
     fn make_closure(&mut self, idx: u32) -> Value {
         let proto = self.protos[idx as usize].clone();
         let f = self.frames.last().expect("frame");
-        let upvals: Rc<[u32]> = proto
+        let upvals: Arc<[u32]> = proto
             .captures
             .iter()
             .map(|c| match c {
