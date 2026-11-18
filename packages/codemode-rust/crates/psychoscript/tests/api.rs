@@ -131,6 +131,22 @@ fn every_deep_form_compiles_without_overflow() {
 }
 
 #[test]
+fn deep_programs_compile_off_a_small_caller_stack() {
+    let code = format!("return {}1", "!".repeat(1_500));
+    let result = std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let rt = Runtime::new();
+            let program = rt.program(&code, &serde_json::Map::new(), None);
+            program.run().unwrap().result
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(result.unwrap(), json!(true));
+}
+
+#[test]
 fn where_a_program_runs_does_not_change_how_deep_it_recurses() {
     let rt = Runtime::new();
     let probe = "let d = 0; const f = () => { d++; [0].map(f) }; try { f() } catch {} return d";

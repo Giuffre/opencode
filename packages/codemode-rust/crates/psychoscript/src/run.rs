@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use crate::compiler;
+use crate::bytecode::Program;
+use crate::compiler::{self, CompileError};
 use crate::convert;
 use crate::host::{self, RunHost};
 use crate::nesting;
@@ -26,35 +27,35 @@ pub const COMPILE_STACK_PER_LEVEL: usize = if cfg!(debug_assertions) {
 /// The native stack a run may use from where it is driven, wherever it runs: past it a call fails with a RangeError, so
 /// where a program runs never changes what it can do. A run on the caller's thread assumes this much is free there.
 pub const RUN_STACK_BUDGET: usize = 512 << 10;
-/// Room on a run's own thread for the frames outside the measured budget.
+/// Room on a compiling thread beyond what the program's nesting needs.
 const THREAD_STACK_BASE: usize = 256 << 10;
 
-/// Runs a program on the caller's thread when its syntax is shallow enough to compile within the run's stack
-/// budget, whatever its length; a deeper one gets a thread with the stack its compiling needs.
 pub fn execute(rt: &Runtime, code: &str, bindings: &serde_json::Map<String, Json>) -> Outcome {
-    let compile = nesting::bound(code).saturating_mul(COMPILE_STACK_PER_LEVEL);
-    if compile <= RUN_STACK_BUDGET {
-        let run = AssertUnwindSafe(|| settled(rt.program(code, bindings, None).run()));
-        return std::panic::catch_unwind(run).unwrap_or_else(|_| internal_error());
+    let run = AssertUnwindSafe(|| settled(rt.program(code, bindings, None).run()));
+    std::panic::catch_unwind(run).unwrap_or_else(|_| internal_error())
+}
+
+/// Compiles on the caller's thread when the program's syntax is shallow enough to compile within the run's stack
+/// budget, whatever its length; a deeper one compiles on a thread with the stack its nesting needs. Running needs no
+/// more native stack for deep syntax, so only compiling moves.
+pub fn compile(code: &str, atoms: &mut Strings) -> Result<Program, CompileError> {
+    let need = nesting::bound(code).saturating_mul(COMPILE_STACK_PER_LEVEL);
+    if need <= RUN_STACK_BUDGET {
+        return compiler::compile(code, atoms);
     }
     std::thread::scope(|s| {
         std::thread::Builder::new()
-            .stack_size(
-                compile
-                    .max(RUN_STACK_BUDGET)
-                    .saturating_add(THREAD_STACK_BASE),
-            )
-            .spawn_scoped(s, || settled(rt.program(code, bindings, None).run()))
-            .map_or_else(
-                |_| {
-                    failed(diagnostic(
-                        DiagnosticKind::ExecutionFailure,
-                        "The program is nested too deeply to start: no thread with enough stack."
-                            .into(),
-                    ))
-                },
-                |handle| handle.join().unwrap_or_else(|_| internal_error()),
-            )
+            .stack_size(need.saturating_add(THREAD_STACK_BASE))
+            .spawn_scoped(s, || compiler::compile(code, atoms))
+            .map_err(|_| CompileError {
+                kind: DiagnosticKind::ExecutionFailure,
+                message:
+                    "The program is nested too deeply to compile: no thread with enough stack."
+                        .into(),
+                offset: None,
+            })?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }
 
@@ -116,7 +117,7 @@ pub fn start<'a>(
     run_id: Option<String>,
 ) -> Result<Box<Running>, Box<Outcome>> {
     let mut atoms = Strings::new();
-    let program = match compiler::compile(&code, &mut atoms) {
+    let program = match compile(&code, &mut atoms) {
         Ok(p) => p,
         Err(e) => {
             let location = e.offset.map(|o| line_col(&code, o));
@@ -157,7 +158,7 @@ pub fn start_for_resume(
     limits: crate::Limits,
 ) -> Result<Resumed, crate::snapshot::SnapshotError> {
     let mut atoms = Strings::new();
-    let program = compiler::compile(&code, &mut atoms).map_err(|_| {
+    let program = compile(&code, &mut atoms).map_err(|_| {
         crate::snapshot::SnapshotError::new(
             "Source main does not compile in this build, so it can't resume.",
         )
