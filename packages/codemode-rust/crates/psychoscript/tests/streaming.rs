@@ -349,3 +349,78 @@ fn suspending_a_run_that_holds_a_streaming_response_matches_the_reference() {
         failures.join("\n")
     );
 }
+
+/// A body whose `cancel` notes whether it ran on the thread driving the run.
+struct Witness {
+    driver: thread::ThreadId,
+    strays: Arc<Mutex<Vec<String>>>,
+}
+
+impl HttpBody for Witness {
+    fn poll_chunk(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, HostValue>>> {
+        Poll::Ready(None)
+    }
+
+    fn cancel(&mut self, _: HostValue) {
+        let here = thread::current().id();
+        let mut log = self.strays.lock().unwrap();
+        log.push(
+            if here == self.driver {
+                "home"
+            } else {
+                "worker"
+            }
+            .to_owned(),
+        );
+    }
+}
+
+#[test]
+fn a_body_cancelled_while_its_run_is_on_a_worker_cancels_on_the_executor() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (driver, witness) = (thread::current().id(), log.clone());
+    let rt = Runtime::new().extension(Extension::new("web").function(
+        "fetch",
+        HostFunction::new_async("fetch", 0, move |_| {
+            let body = Witness {
+                driver,
+                strays: witness.clone(),
+            };
+            async move {
+                Ok(HostValue::Response(StreamingResponse::new(
+                    200,
+                    Some(Box::new(body) as Box<dyn HttpBody>),
+                )))
+            }
+        }),
+    ));
+    // A loop long enough to move to the worker, then a cancel queued there, which starts when the program next looks at
+    // the body after the run has handed calls over: at the `bodyUsed` getter, still on the worker.
+    let code = "const r = await fetch(); let n = 0
+        for (let i = 0; i < 3e6; i++) n += i % 3
+        r.body.cancel('stop')
+        for (let i = 0; i < 1e5; i++) n += i % 3
+        return r.bodyUsed && n > 0";
+    let outcome = drive(rt.execute_async(code, &serde_json::Map::new())).unwrap();
+    assert_eq!(outcome.result.unwrap(), json!(true));
+    assert_eq!(*log.lock().unwrap(), ["home"]);
+}
+
+/// Polls a future to its end on this thread, parking until it is woken.
+fn drive<F: std::future::Future>(future: F) -> F::Output {
+    struct Unpark(thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        thread::park();
+    }
+}
