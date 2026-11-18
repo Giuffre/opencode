@@ -146,6 +146,45 @@ fn deep_programs_compile_off_a_small_caller_stack() {
     assert_eq!(result.unwrap(), json!(true));
 }
 
+/// Programs nested far past the limit, some disguised from a cheap scan by `/`s that may be regexes or divisions, end
+/// with a diagnostic or an outcome. A native stack overflow would abort this test process instead.
+#[test]
+fn deliberately_deep_programs_end_cleanly() {
+    let n = 20_000;
+    let parens = format!("{}1{}", "(".repeat(n), ")".repeat(n));
+    let programs = [
+        format!("return {parens}"),
+        format!("return {}1", "!".repeat(n)),
+        format!("return {}1", "typeof ".repeat(n)),
+        format!("return {}1{}", "[".repeat(n), "]".repeat(n)),
+        format!("return {}1{}", "`${".repeat(n), "}`".repeat(n)),
+        format!("return {}1", "() => ".repeat(n)),
+        format!("{}{}return 1", "{".repeat(n), "}".repeat(n)),
+        format!("let a = 1; {}a = 2", "if (a) a = 1; else ".repeat(n / 2)),
+        format!("let a = 1, g = 1; a++ / {parens} / g"),
+        format!("let await = 1, g = 1; await / {parens} / g"),
+        format!("function f(s) {{ if (s) {{}} /}}/.test(s); return {parens} }}"),
+        format!("// note\u{2028}{parens}"),
+        format!("return typeof\u{a0}{}1", "typeof\u{a0}".repeat(n)),
+    ];
+    std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(move || {
+            let rt = Runtime::new();
+            for code in &programs {
+                let outcome = run(&rt, code);
+                let ended = match &outcome.result {
+                    Ok(_) => true,
+                    Err(d) => d.kind == DiagnosticKind::ParseError,
+                };
+                assert!(ended, "{}: {:?}", &code[..40], outcome.result);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn where_a_program_runs_does_not_change_how_deep_it_recurses() {
     let rt = Runtime::new();

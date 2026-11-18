@@ -1,11 +1,19 @@
-//! A cheap upper bound on how deeply a program's syntax nests, read from its tokens without parsing. Parsing and
-//! compiling recurse once per level of syntax, and the parser has no guard of its own, so this bound decides how much
-//! native stack compiling a program may need.
+//! A cheap upper bound on how deeply a program's syntax nests, read from its bytes without parsing. Parsing and
+//! compiling recurse once per level of syntax, and the parser has no guard of its own: a bound that came out too low
+//! could overflow the native stack, which aborts the process. So the bound is conservative by construction: wherever
+//! the scan cannot tell how the parser reads the source, it takes a reading that can only count more.
 //!
 //! Within one bracket group, a path through the syntax tree passes at most one node per token of the statement or
 //! list item it is in, so the bound adds the tokens of the longest item in each group along the deepest chain of
 //! groups. `;`, `,` and line breaks where a statement cannot continue end an item. `else` and `do` chain statements
 //! across semicolons, so they count for the whole group.
+//!
+//! The only doubt in reading JavaScript without parsing it is whether a `/` starts a regular expression or divides.
+//! Each `/` is a regex, a division, or either, by the token before it. From a `/` that may be either, the rest of the
+//! line is counted raw: every non-blank byte is a token, every opening bracket opens a group, and closing brackets
+//! close nothing. No reading of that line can nest deeper than that, and the readings agree again at the line's end,
+//! unless the line can start something that spans lines (a template, a block comment, a string continued with a
+//! backslash); then, as after source the parser cannot tokenize, everything to the end counts raw.
 
 /// The bound for `code`: never less than its deepest syntax nesting, close to it for ordinary programs.
 pub fn bound(code: &str) -> usize {
@@ -13,9 +21,10 @@ pub fn bound(code: &str) -> usize {
         src: code.as_bytes(),
         at: 0,
         frames: vec![Frame::new(b'\0', false)],
-        prev: Prev::Start,
+        prev: START,
         newline: false,
         control: false,
+        dot: false,
     };
     scan.run();
     let mut child = 0;
@@ -36,7 +45,7 @@ struct Frame {
     best: usize,
     /// `else` and `do` seen anywhere in the group.
     chained: usize,
-    /// Parentheses holding an `if`, `for`, `while` or `with` head: a statement may follow on the next line.
+    /// Parentheses holding an `if`, `for`, `while` or `with` head: a statement follows.
     control: bool,
 }
 
@@ -64,17 +73,51 @@ impl Frame {
     }
 }
 
-/// What the previous token was, for telling a regex from a division and finding where a line break ends a statement.
+/// How a `/` after a token reads.
 #[derive(Clone, Copy, PartialEq)]
-enum Prev {
-    Start,
-    /// A value: a name, literal, or a closing bracket that ends an expression.
-    Value,
-    /// The closing parenthesis of a control head; a statement follows.
-    ControlHead,
-    /// An operator, an opening bracket, or a keyword that an expression follows.
-    Operator,
+enum Slash {
+    Regex,
+    Division,
+    Either,
 }
+
+/// What the previous token tells the scan: how a `/` after it reads, and whether a line break after it may end a
+/// statement before a token that starts one.
+#[derive(Clone, Copy, PartialEq)]
+struct Prev {
+    slash: Slash,
+    ends: bool,
+}
+
+/// The start, an operator, an opening bracket, a separator, or a keyword an expression follows.
+const START: Prev = Prev {
+    slash: Slash::Regex,
+    ends: false,
+};
+const OPERATOR: Prev = START;
+/// The closing parenthesis of a control head: a statement follows.
+const CONTROL_HEAD: Prev = START;
+/// A name, literal, `)` or `]`.
+const VALUE: Prev = Prev {
+    slash: Slash::Division,
+    ends: true,
+};
+/// A name a line break may not end, such as `get` before a method name.
+const PREFIX: Prev = Prev {
+    slash: Slash::Division,
+    ends: false,
+};
+/// A `}`, which ends a block (a regex may follow) or an object (a division may).
+const BRACE: Prev = Prev {
+    slash: Slash::Either,
+    ends: true,
+};
+/// A token the scan cannot place: `++`, `--`, a name that may be a keyword, a byte outside ASCII, or the end of a
+/// line counted raw.
+const EITHER: Prev = Prev {
+    slash: Slash::Either,
+    ends: false,
+};
 
 struct Scan<'a> {
     src: &'a [u8],
@@ -85,39 +128,46 @@ struct Scan<'a> {
     newline: bool,
     /// The previous token was `if`, `for`, `while` or `with`.
     control: bool,
+    /// The previous token was a `.` of member access: a keyword after it is a property name.
+    dot: bool,
 }
 
 impl Scan<'_> {
     fn run(&mut self) {
+        if self.src.starts_with(b"#!") {
+            self.raw(false);
+        }
         while let Some(&b) = self.src.get(self.at) {
             match b {
                 b'\n' | b'\r' => {
                     self.newline = true;
                     self.at += 1;
                 }
-                b' ' | b'\t' | 0x0b | 0x0c => self.at += 1,
-                b'/' if self.peek(1) == Some(b'/') => {
-                    while self
-                        .src
-                        .get(self.at)
-                        .is_some_and(|&c| c != b'\n' && c != b'\r')
-                    {
-                        self.at += 1;
-                    }
+                0xe2 if line_separator(self.src, self.at) => {
+                    self.newline = true;
+                    self.at += 3;
                 }
+                b' ' | b'\t' | 0x0b | 0x0c => self.at += 1,
+                b'/' if self.peek(1) == Some(b'/') => self.at = line_end(self.src, self.at),
                 b'/' if self.peek(1) == Some(b'*') => {
-                    self.at += 2;
-                    while self.at < self.src.len() && !self.src[self.at..].starts_with(b"*/") {
-                        self.newline |= matches!(self.src[self.at], b'\n' | b'\r');
-                        self.at += 1;
-                    }
-                    self.at += 2;
+                    let rest = &self.src[self.at + 2..];
+                    let len = rest.windows(2).position(|w| w == b"*/");
+                    let body = &rest[..len.unwrap_or(rest.len())];
+                    self.newline |= line_end(body, 0) < body.len();
+                    self.at += 2 + len.map_or(rest.len(), |n| n + 2);
+                }
+                // An HTML-like comment in a script, an operator in a module: counted raw, either way.
+                b'<' if self.src[self.at..].starts_with(b"<!--") => self.raw(false),
+                b'-' if self.src[self.at..].starts_with(b"-->")
+                    && (self.newline || self.prev == START) =>
+                {
+                    self.raw(false)
                 }
                 b'(' | b'[' | b'{' => {
                     self.token(false);
                     let control = b == b'(' && self.control;
                     self.frames.push(Frame::new(b, control));
-                    self.after(Prev::Operator);
+                    self.after(OPERATOR);
                     self.at += 1;
                 }
                 b')' | b']' | b'}' => {
@@ -126,39 +176,76 @@ impl Scan<'_> {
                 }
                 b';' | b',' => {
                     self.top().end_item();
-                    self.after(Prev::Operator);
+                    self.after(OPERATOR);
                     self.at += 1;
                 }
                 b'\'' | b'"' => {
+                    let start = self.at;
                     self.token(true);
-                    self.string(b);
-                    self.after(Prev::Value);
+                    if !self.string(b) {
+                        self.at = start;
+                        return self.raw(true);
+                    }
+                    self.after(VALUE);
                 }
                 b'`' => {
                     self.token(false);
                     self.at += 1;
                     self.template();
                 }
-                b'/' if self.prev != Prev::Value => {
-                    self.token(false);
-                    self.regex();
-                    self.after(Prev::Value);
-                }
+                b'/' => match self.prev.slash {
+                    Slash::Regex => {
+                        let start = self.at;
+                        self.token(false);
+                        if !self.regex() {
+                            self.at = start;
+                            return self.raw(true);
+                        }
+                        self.after(VALUE);
+                    }
+                    Slash::Division => {
+                        self.token(false);
+                        self.after(OPERATOR);
+                        self.at += 1;
+                    }
+                    Slash::Either => self.raw(false),
+                },
                 b'0'..=b'9' => {
                     self.token(true);
                     self.number();
-                    self.after(Prev::Value);
+                    self.after(VALUE);
                 }
                 b'.' if self.peek(1).is_some_and(|c| c.is_ascii_digit()) => {
                     self.token(true);
                     self.number();
-                    self.after(Prev::Value);
+                    self.after(VALUE);
                 }
                 _ if is_name(b) => self.word(),
-                // Every other character is an operator or part of one; counting each keeps `!!x` and `- -x` deep.
+                b'.' => {
+                    self.token(false);
+                    let spread = self.peek(1) == Some(b'.')
+                        || (self.at > 0 && self.src[self.at - 1] == b'.');
+                    self.after(OPERATOR);
+                    self.dot = !spread;
+                    self.at += 1;
+                }
+                // `++` and `--` may be postfix, after which a `/` divides, or prefix, after which it may not.
+                b'+' | b'-' => {
+                    self.token(false);
+                    let doubled = self.at > 0 && self.src[self.at - 1] == b;
+                    self.after(if doubled { EITHER } else { OPERATOR });
+                    self.at += 1;
+                }
+                // Outside ASCII a byte may be part of a name or a space; a backslash starts an escaped name.
+                _ if b >= 0x80 || b == b'\\' => {
+                    self.token(false);
+                    self.after(EITHER);
+                    self.at += 1;
+                }
+                // Every other character is an operator or part of one; counting each keeps `!!x` and `~~x` deep.
                 _ => {
                     self.token(false);
-                    self.after(Prev::Operator);
+                    self.after(OPERATOR);
                     self.at += 1;
                 }
             }
@@ -177,7 +264,7 @@ impl Scan<'_> {
 
     /// Counts a token in the current item, first ending the item when a line break before it ends a statement.
     fn token(&mut self, starts_statement: bool) {
-        if self.newline && starts_statement && self.prev == Prev::Value {
+        if self.newline && starts_statement && self.prev.ends {
             self.top().end_item();
         }
         self.newline = false;
@@ -187,6 +274,37 @@ impl Scan<'_> {
     fn after(&mut self, prev: Prev) {
         self.prev = prev;
         self.control = false;
+        self.dot = false;
+    }
+
+    /// Counts from here to the end of the line, or of the source, without telling code from text: every non-blank
+    /// byte is a token and every opening bracket opens a group that only a later closer outside the raw span closes.
+    fn raw(&mut self, to_end: bool) {
+        let line = line_end(self.src, self.at);
+        let spans_lines = {
+            let rest = &self.src[self.at..line];
+            rest.contains(&b'`')
+                || rest.windows(2).any(|w| w == b"/*")
+                || rest.last() == Some(&b'\\')
+        };
+        let end = if to_end || spans_lines {
+            self.src.len()
+        } else {
+            line
+        };
+        self.newline = false;
+        for i in self.at..end {
+            let b = self.src[i];
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            self.top().tokens += 1;
+            if matches!(b, b'(' | b'[' | b'{') {
+                self.frames.push(Frame::new(b, false));
+            }
+        }
+        self.at = end;
+        self.after(EITHER);
     }
 
     fn close(&mut self, b: u8) {
@@ -195,24 +313,23 @@ impl Scan<'_> {
             b']' => b'[',
             _ => b'{',
         };
-        // A closer that does not match is ignored: popping on it could only lower the bound.
+        // A closer that does not match is counted, not obeyed: popping on it could only lower the bound.
         let top = self.top().open;
         if self.frames.len() == 1 || (top != open && !(top == b'$' && b == b'}')) {
+            self.token(false);
+            self.after(EITHER);
             return;
         }
         let mut frame = self.frames.pop().expect("checked above");
         let depth = frame.close();
         let parent = self.top();
         parent.child = parent.child.max(depth);
-        if frame.open == b'$' {
-            self.template();
-            return;
+        match frame.open {
+            b'$' => self.template(),
+            b'{' => self.after(BRACE),
+            _ if frame.control => self.after(CONTROL_HEAD),
+            _ => self.after(VALUE),
         }
-        self.after(if frame.control {
-            Prev::ControlHead
-        } else {
-            Prev::Value
-        });
     }
 
     fn word(&mut self) {
@@ -225,28 +342,47 @@ impl Scan<'_> {
             self.at += 1;
         }
         let word = &self.src[start..self.at];
-        let continues = matches!(word, b"in" | b"instanceof" | b"of");
+        let member = self.dot;
+        // Words that continue the statement before a line break.
+        let continues = !member
+            && matches!(
+                word,
+                b"in" | b"instanceof" | b"of" | b"else" | b"catch" | b"finally" | b"while"
+            );
         self.token(!continues);
         if matches!(word, b"else" | b"do") {
             self.top().chained += 1;
         }
-        let value =
-            matches!(word, b"this" | b"null" | b"true" | b"false" | b"super") || !is_keyword(word);
-        self.after(if value { Prev::Value } else { Prev::Operator });
-        self.control = matches!(word, b"if" | b"for" | b"while" | b"with");
+        let prev = match word {
+            _ if member => VALUE,
+            b"this" | b"null" | b"true" | b"false" | b"super" => VALUE,
+            // Keywords in some places and names in others.
+            b"await" | b"yield" | b"of" | b"let" => EITHER,
+            b"get" | b"set" | b"static" | b"async" | b"accessor" => PREFIX,
+            _ if is_keyword(word) => OPERATOR,
+            _ => VALUE,
+        };
+        let control = !member
+            && (matches!(word, b"if" | b"for" | b"while" | b"with")
+                || (self.control && word == b"await"));
+        self.after(prev);
+        self.control = control;
     }
 
-    fn string(&mut self, quote: u8) {
+    /// Scans a string; false when it does not end on its line.
+    fn string(&mut self, quote: u8) -> bool {
         self.at += 1;
         while let Some(&c) = self.src.get(self.at) {
             self.at += 1;
             match c {
+                b'\\' if self.src[self.at..].starts_with(b"\r\n") => self.at += 2,
                 b'\\' => self.at += 1,
-                b'\n' | b'\r' => return,
-                _ if c == quote => return,
+                b'\n' | b'\r' => return false,
+                _ if c == quote => return true,
                 _ => {}
             }
         }
+        false
     }
 
     /// Scans template text up to its end or its next substitution, which opens a group.
@@ -256,13 +392,13 @@ impl Scan<'_> {
             match c {
                 b'\\' => self.at += 1,
                 b'`' => {
-                    self.after(Prev::Value);
+                    self.after(VALUE);
                     return;
                 }
                 b'$' if self.src.get(self.at) == Some(&b'{') => {
                     self.at += 1;
                     self.frames.push(Frame::new(b'$', false));
-                    self.after(Prev::Operator);
+                    self.after(OPERATOR);
                     return;
                 }
                 _ => {}
@@ -270,14 +406,29 @@ impl Scan<'_> {
         }
     }
 
-    fn regex(&mut self) {
+    /// Scans a regex; false when it does not end on its line.
+    fn regex(&mut self) -> bool {
         self.at += 1;
         let mut class = false;
-        while let Some(&c) = self.src.get(self.at) {
+        loop {
+            if self.at >= self.src.len() || matches!(self.src[self.at], b'\n' | b'\r') {
+                return false;
+            }
+            if line_separator(self.src, self.at) {
+                return false;
+            }
+            let c = self.src[self.at];
             self.at += 1;
             match c {
-                b'\\' => self.at += 1,
-                b'\n' | b'\r' => return,
+                b'\\' => {
+                    let next = self.src.get(self.at);
+                    if next.is_none_or(|&n| matches!(n, b'\n' | b'\r'))
+                        || line_separator(self.src, self.at)
+                    {
+                        return false;
+                    }
+                    self.at += 1;
+                }
                 b'[' => class = true,
                 b']' => class = false,
                 b'/' if !class => break,
@@ -287,6 +438,7 @@ impl Scan<'_> {
         while self.src.get(self.at).is_some_and(|&c| is_name(c)) {
             self.at += 1;
         }
+        true
     }
 
     fn number(&mut self) {
@@ -303,15 +455,26 @@ impl Scan<'_> {
 }
 
 fn is_name(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b == b'\\' || b >= 0x80
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+/// U+2028 or U+2029, which end a line as `\n` does.
+fn line_separator(src: &[u8], at: usize) -> bool {
+    src[at..].starts_with(&[0xe2, 0x80, 0xa8]) || src[at..].starts_with(&[0xe2, 0x80, 0xa9])
+}
+
+/// Where the line holding `at` ends.
+fn line_end(src: &[u8], at: usize) -> usize {
+    (at..src.len())
+        .find(|&i| matches!(src[i], b'\n' | b'\r') || line_separator(src, i))
+        .unwrap_or(src.len())
 }
 
 /// Words after which an expression, not an operator, comes next.
 fn is_keyword(word: &[u8]) -> bool {
     matches!(
         word,
-        b"await"
-            | b"break"
+        b"break"
             | b"case"
             | b"catch"
             | b"class"
@@ -331,9 +494,7 @@ fn is_keyword(word: &[u8]) -> bool {
             | b"import"
             | b"in"
             | b"instanceof"
-            | b"let"
             | b"new"
-            | b"of"
             | b"return"
             | b"switch"
             | b"throw"
@@ -343,7 +504,6 @@ fn is_keyword(word: &[u8]) -> bool {
             | b"void"
             | b"while"
             | b"with"
-            | b"yield"
     )
 }
 
@@ -452,6 +612,47 @@ mod tests {
                 "{open:?}: {per} per level"
             );
         }
+    }
+
+    /// Each source hides a group nested 400 deep from a scan that guessed wrong about a `/`, a line end, or a byte.
+    #[test]
+    fn no_reading_of_an_unclear_token_hides_nesting() {
+        let n = 400;
+        let d = format!("{}1{}", "(".repeat(n), ")".repeat(n));
+        let typeofs = "typeof\u{a0}".repeat(n);
+        let cases = [
+            format!("let a = 1, g = 1; a++ / {d} / g"),
+            format!("let a = 1, g = 1; a-- /{d}/ g"),
+            format!("function f(s) {{ if (s) {{}} /}}/.test(s); return {d} }}"),
+            format!("function f(s) {{ if (s) {{}} /))))/.test(s); return [{d}] }}"),
+            format!("const o = {{}} / {d} / 2"),
+            format!("let await = 1, g = 1; await / {d} / g"),
+            format!("let of = 1, g = 1; of / {d} / g"),
+            format!("const x = {{}}; x.return / {d} / 2"),
+            format!("let a = 1; a\u{a0}/ {d} /\u{a0}1"),
+            format!("return {typeofs}1"),
+            format!("x = 1 <!-- {d}"),
+            format!("x = 1\n--> {d}"),
+            format!("// note\u{2028}{d}"),
+            format!("/* note */ {d}"),
+            format!("const s = 'unterminated\n{d}"),
+            format!("const r = /unterminated\n{d}"),
+            format!("let a = 1; a++ / `${{1}}\n${{{d}}}` / 1"),
+            format!("let a = 1; a++ / 1 /* ((( \n */ {d}"),
+            format!("let a = 1; x = a++ / 'x\\\n{d}'"),
+        ];
+        for case in cases {
+            let b = bound(&case);
+            assert!(b >= n, "{} is bounded by {b}", &case[..case.len().min(70)]);
+        }
+    }
+
+    #[test]
+    fn regexes_and_divisions_the_scan_is_sure_of_stay_cheap() {
+        let plain = bound("const r = /[(]+/g; const q = a / b / c; return r.test(q)");
+        assert!(plain < 20, "{plain}");
+        let after_block = bound("if (a) { b() }\nconst c = d / e");
+        assert!(after_block < 20, "{after_block}");
     }
 
     #[test]
