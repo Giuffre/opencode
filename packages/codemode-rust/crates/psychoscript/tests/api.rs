@@ -114,6 +114,32 @@ fn deep_input_does_not_overflow() {
 }
 
 #[test]
+fn every_deep_form_compiles_without_overflow() {
+    let rt = Runtime::new();
+    let forms = [
+        ("return ", "!", "1"),
+        ("return ", "`${", "1}`"),
+        ("return ", "() => ", "1"),
+        ("let a = 1; ", "if (a) a = 1; else ", "a = 2; return a"),
+        ("let a = 1;\n", "if (a)\n", "a = 2; return a"),
+    ];
+    for (head, form, tail) in forms {
+        let code = format!("{head}{}{tail}", form.repeat(900));
+        let code = code.replace("1}`", &format!("1{}", "}`".repeat(900)));
+        assert!(run(&rt, &code).result.is_ok(), "{form:?}");
+    }
+}
+
+#[test]
+fn where_a_program_runs_does_not_change_how_deep_it_recurses() {
+    let rt = Runtime::new();
+    let probe = "let d = 0; const f = () => { d++; [0].map(f) }; try { f() } catch {} return d";
+    let shallow = run(&rt, probe).result.unwrap();
+    let nested = format!("{}0{}; {probe}", "(".repeat(800), ")".repeat(800));
+    assert_eq!(run(&rt, &nested).result.unwrap(), shallow);
+}
+
+#[test]
 fn bindings_are_globals_programs_can_shadow() {
     let mut bindings = serde_json::Map::new();
     bindings.insert("n".into(), Json::from(4));

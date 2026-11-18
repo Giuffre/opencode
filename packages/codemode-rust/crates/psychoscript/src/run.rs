@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::compiler;
 use crate::convert;
 use crate::host::{self, RunHost};
+use crate::nesting;
 use crate::object::{Closure, Kind, Obj};
 use crate::program::Running;
 use crate::strings::Strings;
@@ -14,49 +15,47 @@ use crate::value::Value;
 use crate::vm::Vm;
 use crate::{Diagnostic, DiagnosticKind, Json, Outcome, Runtime};
 
-/// Small programs run on the caller's thread with a modest native-stack budget. Larger ones, whose parse can
-/// recurse deeper, run on their own thread with a large stack; the reservation is virtual, only touched pages are
-/// committed.
-const INLINE_SOURCE_BYTES: usize = 2048;
-const INLINE_BRACKET_DEPTH: usize = 64;
-pub const INLINE_STACK_BUDGET: usize = 512 << 10;
-const STACK_SIZE: usize = 256 << 20;
-const THREAD_STACK_BUDGET: usize = 64 << 20;
+/// Native stack that parsing and compiling may use per unit of [`nesting::bound`], measured with
+/// `bench/examples/stack_probe.rs`, with headroom. The costliest form per unit is a chain of prefix operators: 737 B a
+/// level in release builds and 9.3 KB in debug builds.
+pub const COMPILE_STACK_PER_LEVEL: usize = if cfg!(debug_assertions) {
+    12 << 10
+} else {
+    1 << 10
+};
+/// The native stack a run may use from where it is driven, wherever it runs: past it a call fails with a RangeError, so
+/// where a program runs never changes what it can do. A run on the caller's thread assumes this much is free there.
+pub const RUN_STACK_BUDGET: usize = 512 << 10;
+/// Room on a run's own thread for the frames outside the measured budget.
+const THREAD_STACK_BASE: usize = 256 << 10;
 
+/// Runs a program on the caller's thread when its syntax is shallow enough to compile within the run's stack
+/// budget, whatever its length; a deeper one gets a thread with the stack its compiling needs.
 pub fn execute(rt: &Runtime, code: &str, bindings: &serde_json::Map<String, Json>) -> Outcome {
-    if code.len() <= INLINE_SOURCE_BYTES && bracket_depth(code) <= INLINE_BRACKET_DEPTH {
+    let compile = nesting::bound(code).saturating_mul(COMPILE_STACK_PER_LEVEL);
+    if compile <= RUN_STACK_BUDGET {
         let run = AssertUnwindSafe(|| settled(rt.program(code, bindings, None).run()));
         return std::panic::catch_unwind(run).unwrap_or_else(|_| internal_error());
     }
     std::thread::scope(|s| {
-        let spawned = std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
-            .spawn_scoped(s, || {
-                let mut program = rt.program(code, bindings, None);
-                program.stack_budget = THREAD_STACK_BUDGET;
-                settled(program.run())
-            });
-        match spawned {
-            Ok(handle) => handle.join().unwrap_or_else(|_| internal_error()),
-            Err(_) => settled(rt.program(code, bindings, None).run()),
-        }
+        std::thread::Builder::new()
+            .stack_size(
+                compile
+                    .max(RUN_STACK_BUDGET)
+                    .saturating_add(THREAD_STACK_BASE),
+            )
+            .spawn_scoped(s, || settled(rt.program(code, bindings, None).run()))
+            .map_or_else(
+                |_| {
+                    failed(diagnostic(
+                        DiagnosticKind::ExecutionFailure,
+                        "The program is nested too deeply to start: no thread with enough stack."
+                            .into(),
+                    ))
+                },
+                |handle| handle.join().unwrap_or_else(|_| internal_error()),
+            )
     })
-}
-
-/// The deepest bracket nesting in the source text, a cheap bound on how deep parsing recurses.
-fn bracket_depth(code: &str) -> usize {
-    let (mut depth, mut max) = (0usize, 0usize);
-    for b in code.bytes() {
-        match b {
-            b'(' | b'[' | b'{' => {
-                depth += 1;
-                max = max.max(depth);
-            }
-            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    max
 }
 
 /// The outcome of a run, or for an interrupted one, an `ExecutionFailure` that says so.
