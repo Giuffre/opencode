@@ -335,7 +335,7 @@ impl<'a> Program<'a> {
                     break;
                 }
                 if self.offload {
-                    r.vm.host.offload_at = Some(Instant::now() + offload::OFFLOAD_AFTER);
+                    r.vm.host.offload().at = Some(Instant::now() + offload::OFFLOAD_AFTER);
                 }
                 if !r.started {
                     r.started = true;
@@ -359,7 +359,7 @@ impl<'a> Program<'a> {
                 }
                 let away = std::mem::take(&mut self.move_away);
                 if let Some(worker) = self.worker.as_ref().filter(|_| away) {
-                    r.vm.host.offload_at = None;
+                    r.vm.host.offload().at = None;
                     let State::Running(r) = std::mem::replace(&mut self.state, State::Away) else {
                         unreachable!()
                     };
@@ -370,7 +370,9 @@ impl<'a> Program<'a> {
                 if !r.vm.suspended {
                     let _ = r.vm.drive();
                 }
-                r.vm.host.offload_at = None;
+                if let Some(o) = &mut r.vm.host.offload {
+                    o.at = None;
+                }
             }
             if r.vm.outcome.is_some() || r.vm.fatal.is_some() {
                 break;
@@ -378,7 +380,11 @@ impl<'a> Program<'a> {
             // A stop to move only: the stretch continues on the worker, and the next one starts here again. A suspend at
             // the same stop goes first.
             if r.vm.suspended
-                && std::mem::take(&mut r.vm.host.offload_due)
+                && r.vm
+                    .host
+                    .offload
+                    .as_mut()
+                    .is_some_and(|o| std::mem::take(&mut o.due))
                 && !self.shared.requested.load(Ordering::Relaxed)
             {
                 r.vm.suspended = false;

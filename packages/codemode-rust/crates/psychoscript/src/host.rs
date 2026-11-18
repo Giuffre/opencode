@@ -203,11 +203,9 @@ pub struct RunHost {
     pub(crate) meter: Meter,
     /// Set while a carrier result (`HostFunction::carrier`) crosses in.
     pub(crate) carrier: bool,
-    /// Where host code runs while the run computes on a worker thread.
-    pub(crate) home: Option<crate::offload::Home>,
-    /// When the stretch of compute in progress has run long enough to move to a worker thread, and whether it has.
-    pub(crate) offload_at: Option<std::time::Instant>,
-    pub(crate) offload_due: bool,
+    /// Moving long stretches of compute to a worker thread, for a run driven as a future. Boxed: the VM's hot fields
+    /// sit after this struct, and a few more bytes here measurably slow its dispatch loop.
+    pub(crate) offload: Option<Box<crate::offload::Offload>>,
 }
 
 /// The reference's fuel left (`handover`) and the steps left until the VM next checks the clock (`fuel`), as of when
@@ -251,9 +249,7 @@ impl RunHost {
             namespaces: FxHashMap::default(),
             epoch: Default::default(),
             carrier: false,
-            home: None,
-            offload_at: None,
-            offload_due: false,
+            offload: None,
             meter: Meter {
                 start: crate::vm::HANDOVER_FUEL,
                 handover: crate::vm::HANDOVER_FUEL,
@@ -262,6 +258,16 @@ impl RunHost {
                 counted: false,
             },
         }
+    }
+
+    /// Where host code runs while the run computes on a worker thread.
+    pub(crate) fn home(&self) -> Option<&crate::offload::Home> {
+        crate::offload::home(&self.offload)
+    }
+
+    /// The run's offload state, made on first use.
+    pub(crate) fn offload(&mut self) -> &mut crate::offload::Offload {
+        self.offload.get_or_insert_default()
     }
 
     /// Whether host work is still in flight, so an idle program is waiting rather than stuck.
@@ -435,7 +441,7 @@ pub(crate) fn start_tool(vm: &mut Vm, p: Id, path: &str, args: Vec<Option<Json>>
     {
         let shared = vm.host.shared.clone();
         shared.enter_sync(&vm.host, admitted.call, tool_expression(path));
-        let raw = match vm.host.home.clone() {
+        let raw = match vm.host.home().cloned() {
             None => f(admitted.input, vm.host.sync_context(admitted.call)),
             Some(home) => {
                 let (f, ctx) = (f.clone(), vm.host.sync_context(admitted.call).clone());
@@ -509,7 +515,11 @@ pub fn spawn_tool(
         phase,
         start,
     ));
-    match vm.host.tasks.spawn(p, future, vm.host.home.as_ref()) {
+    match vm
+        .host
+        .tasks
+        .spawn(p, future, crate::offload::home(&vm.host.offload))
+    {
         Poll::Ready(s) => vm.inbox.push_back((p, s)),
         Poll::Pending => vm.host.calls.push(Call {
             promise: p,
@@ -1516,7 +1526,7 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
                 }
                 Ok(result)
             };
-            let called = match vm.host.home.clone() {
+            let called = match vm.host.home().cloned() {
                 None => Some(host_call()),
                 Some(home) => home.run(host_call),
             };
@@ -1567,7 +1577,11 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
                 guard.end(&result);
                 Settlement::Host(Box::new((result, label, extension_name, carrier)))
             });
-            match vm.host.tasks.spawn(p, future, vm.host.home.as_ref()) {
+            match vm
+                .host
+                .tasks
+                .spawn(p, future, crate::offload::home(&vm.host.offload))
+            {
                 Poll::Ready(s) => vm.inbox.push_back((p, s)),
                 Poll::Pending => vm.host.calls.push(Call {
                     promise: p,

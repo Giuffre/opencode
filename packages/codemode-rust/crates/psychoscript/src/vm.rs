@@ -881,13 +881,11 @@ impl Vm {
             self.suspend_wanted = true;
         }
         // A long stretch of compute stops to move to a worker thread: see `offload`.
-        if self
-            .host
-            .offload_at
-            .is_some_and(|at| std::time::Instant::now() >= at)
+        if let Some(o) = &mut self.host.offload
+            && o.at.is_some_and(|at| std::time::Instant::now() >= at)
         {
-            self.host.offload_at = None;
-            self.host.offload_due = true;
+            o.at = None;
+            o.due = true;
             self.suspend_wanted = true;
         }
         if self

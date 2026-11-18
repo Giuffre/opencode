@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::program::Running;
 use crate::run::{RUN_STACK_BUDGET, THREAD_STACK_BASE};
@@ -20,6 +20,15 @@ pub const OFFLOAD_AFTER: Duration = Duration::from_millis(1);
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// A run's side of moving: when the stretch of compute in progress has run long enough to move, whether it stopped to,
+/// and where its host code runs while it is away.
+#[derive(Default)]
+pub struct Offload {
+    pub at: Option<Instant>,
+    pub due: bool,
+    pub home: Option<Home>,
+}
+
 enum ToHome {
     /// Host code for the driving thread to run.
     Job(Job),
@@ -27,6 +36,11 @@ enum ToHome {
     Back(Box<Running>),
     /// The interpreter panicked on the worker; the panic continues where the run is driven, as it would have there.
     Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// Where host code runs while a run with this offload state computes on a worker thread.
+pub fn home(offload: &Option<Box<Offload>>) -> Option<&Home> {
+    offload.as_ref()?.home.as_ref()
 }
 
 /// The way back to the thread driving a run, for its host code.
@@ -159,10 +173,10 @@ fn compute(r: &mut Running, home: &Home) {
     let probe = 0u8;
     r.vm.stack_base = &probe as *const u8 as usize;
     r.vm.stack_budget = RUN_STACK_BUDGET;
-    r.vm.host.home = Some(home.clone());
+    r.vm.host.offload().home = Some(home.clone());
     let _ = r.vm.continue_frames();
     if !r.vm.suspended {
         let _ = r.vm.drive();
     }
-    r.vm.host.home = None;
+    r.vm.host.offload().home = None;
 }
