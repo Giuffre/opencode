@@ -14,16 +14,16 @@ use crate::snapshot::{self, Refusal, Snapshot};
 use crate::vm::Vm;
 use crate::{Interrupted, Json, Outcome, Runtime};
 
-enum State<'a> {
-    Running(Box<Running<'a>>),
+enum State {
+    Running(Box<Running>),
     /// It ended before running: the program did not compile.
     Failed(Box<Outcome>),
     Done,
 }
 
-pub(crate) struct Running<'a> {
-    pub vm: Vm<'a>,
-    pub code: Cow<'a, str>,
+pub(crate) struct Running {
+    pub vm: Vm,
+    pub code: String,
     started: bool,
     timer_armed: bool,
     /// Active time earlier runs of the same execution used, before a resume.
@@ -219,7 +219,7 @@ impl Suspender {
 /// A program ready to run once. Dropping it interrupts the run and cancels every host call in flight.
 pub struct Program<'a> {
     rt: &'a Runtime,
-    state: State<'a>,
+    state: State,
     shared: Arc<Shared>,
 }
 
@@ -238,7 +238,7 @@ impl<'a> Program<'a> {
         Self::with(rt, state)
     }
 
-    fn with(rt: &'a Runtime, state: State<'a>) -> Self {
+    fn with(rt: &'a Runtime, state: State) -> Self {
         let shared = match &state {
             State::Running(r) => r.vm.host.shared.clone(),
             _ => Arc::default(),
@@ -506,10 +506,7 @@ fn done_or_suspended(o: RunOutcome) -> Outcome {
 }
 
 /// Rebuilds a suspended run in a fresh VM of this runtime.
-fn restore<'a>(
-    rt: &'a Runtime,
-    state: &Snapshot,
-) -> Result<Box<Running<'a>>, snapshot::SnapshotError> {
+fn restore(rt: &Runtime, state: &Snapshot) -> Result<Box<Running>, snapshot::SnapshotError> {
     let restored = snapshot::header(rt.setup(), state)?;
     let mut started = run::start_for_resume(rt, restored.code, restored.run_id, restored.limits)?;
     snapshot::restore(&mut started.running.vm, state, &started.bytecode)?;
@@ -523,11 +520,11 @@ fn restore<'a>(
 // A run's state may move to another thread between steps.
 const _: () = {
     const fn send<T: Send>() {}
-    send::<Running<'static>>()
+    send::<Running>()
 };
 
-impl<'a> Running<'a> {
-    pub fn new(vm: Vm<'a>, code: Cow<'a, str>) -> Self {
+impl Running {
+    pub fn new(vm: Vm, code: String) -> Self {
         Self {
             vm,
             code,

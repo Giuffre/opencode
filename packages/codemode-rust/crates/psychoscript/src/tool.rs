@@ -341,6 +341,19 @@ pub struct Registry {
     index: OnceLock<crate::search::WordIndex>,
 }
 
+impl Clone for Registry {
+    /// A copy with its derived catalog and search index built again on first use.
+    fn clone(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            namespaces: self.namespaces.clone(),
+            order: self.order.clone(),
+            entries: OnceLock::new(),
+            index: OnceLock::new(),
+        }
+    }
+}
+
 impl Registry {
     pub fn insert(&mut self, path: &str, tool: Tool) {
         if self.tools.insert(path.to_owned(), Arc::new(tool)).is_none() {

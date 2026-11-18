@@ -113,12 +113,12 @@ struct Natives {
 fn natives() -> &'static Natives {
     static TABLE: OnceLock<Natives> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let setup: &'static Setup = Box::leak(Box::new(Setup {
+        let setup = Arc::new(Setup {
             registry: Default::default(),
             hooks: Default::default(),
             extensions: Vec::new(),
             limits: Limits::default(),
-        }));
+        });
         let mut vm = Vm::new(
             host::RunHost::new(setup, None),
             Limits::default(),
@@ -318,8 +318,8 @@ pub struct Capture<'c> {
     pub active_ms: u64,
 }
 
-struct Enc<'v, 'rt> {
-    vm: &'v Vm<'rt>,
+struct Enc<'v> {
+    vm: &'v Vm,
     natives: &'static Natives,
     protos: FxHashMap<usize, usize>,
     buffers: Vec<Arc<std::sync::Mutex<Vec<u8>>>>,
@@ -367,7 +367,7 @@ pub fn capture(vm: &Vm, c: &Capture) -> Result<Snapshot, Refusal> {
     let limits = vm.limits;
     let header = json!({
         "build": build_id(),
-        "hosts": hosts_id(vm.host.setup),
+        "hosts": hosts_id(&vm.host.setup),
         "runId": vm.host.run_id.get().cloned(),
         "source": {
             "code": c.code,
@@ -387,7 +387,7 @@ pub fn capture(vm: &Vm, c: &Capture) -> Result<Snapshot, Refusal> {
     ))
 }
 
-impl Enc<'_, '_> {
+impl Enc<'_> {
     fn state(&mut self, c: &Capture) -> R<J> {
         let vm = self.vm;
         let base = vm.snapshot_base;
@@ -451,7 +451,7 @@ impl Enc<'_, '_> {
     fn host(&mut self, _c: &Capture) -> R<J> {
         let h = &self.vm.host;
         let base = self.vm.snapshot_base;
-        let setup = h.setup;
+        let setup = &h.setup;
         // Each result an extension's hooks can bring back, as the data its `encode` made.
         let mut results = Vec::new();
         for root in &h.results {
@@ -899,7 +899,11 @@ fn baseline(vm: &Vm, code: &str) -> R<Vec<J>> {
     let mut atoms = crate::strings::Strings::new();
     let program =
         crate::compiler::compile(code, &mut atoms).map_err(|e| SnapshotError::new(e.message))?;
-    let mut fresh = Vm::new(host::RunHost::new(vm.host.setup, None), vm.limits, atoms);
+    let mut fresh = Vm::new(
+        host::RunHost::new(vm.host.setup.clone(), None),
+        vm.limits,
+        atoms,
+    );
     fresh.setup();
     host::install(&mut fresh, &program.globals);
     crate::builtins::ensure_globals(&mut fresh, &program.globals);
@@ -2050,7 +2054,7 @@ fn restore_settlement(vm: &mut Vm, dec: &Dec, j: &J) -> R<(Id, Settlement)> {
             let hooked = boolean(at(j, 5)?)?;
             let mut v = host_value_from(at(j, 6)?)?;
             if hooked {
-                let hooks = hooks_of(vm.host.setup, &extension)?;
+                let hooks = hooks_of(&vm.host.setup, &extension)?;
                 v = (hooks.decode)(v);
             }
             let carrier = j.get(7).and_then(J::as_bool).unwrap_or(false);
@@ -2081,13 +2085,13 @@ fn hooks_of<'s>(setup: &'s Setup, extension: &str) -> R<&'s crate::extension::Sn
 }
 
 fn restore_host(vm: &mut Vm, dec: &Dec, j: &J, base: Base) -> R<()> {
-    let setup = vm.host.setup;
+    let setup = vm.host.setup.clone();
     vm.host.next_call = uint(field(j, "nextCall")?)?;
     // Results an extension's hooks saved: decoded once each, their functions taken in order.
     let mut restored: Vec<(usize, Vec<HostFunction>)> = Vec::new();
     for r in field_list(j, "results")? {
         let extension = string(at(r, 0)?)?;
-        let hooks = hooks_of(setup, &extension)?;
+        let hooks = hooks_of(&setup, &extension)?;
         let value = (hooks.decode)(host_value_from(at(r, 1)?)?);
         let mut fns = Vec::new();
         collect_functions(&value, &mut fns);
@@ -2194,15 +2198,15 @@ fn restore_host(vm: &mut Vm, dec: &Dec, j: &J, base: Base) -> R<()> {
 }
 
 /// Calls to start again once the restored run begins, so their futures start on the run's executor.
-fn pending_calls<'v>(vm: &'v mut Vm) -> &'v mut Vec<(Id, String, Json, u64, host::Start)> {
+fn pending_calls(vm: &mut Vm) -> &mut Vec<(Id, String, Json, u64, host::Start)> {
     &mut vm.host.restarts
 }
 
 /// The calls a resumed run restarts, in the order they were in flight.
 pub fn restart_calls(vm: &mut Vm) {
-    let setup = vm.host.setup;
+    let setup = vm.host.setup.clone();
     for (p, path, input, call, start) in std::mem::take(&mut vm.host.restarts) {
-        if let Some(tool) = setup.registry.get(&path) {
+        if let Some(tool) = setup.registry.get(&path).cloned() {
             host::spawn_tool(vm, p, &path, tool, input, call, start);
         }
     }

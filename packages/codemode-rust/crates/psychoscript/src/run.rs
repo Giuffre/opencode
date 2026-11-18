@@ -114,7 +114,7 @@ pub fn start<'a>(
     code: Cow<'a, str>,
     bindings: &serde_json::Map<String, Json>,
     run_id: Option<String>,
-) -> Result<Box<Running<'a>>, Box<Outcome>> {
+) -> Result<Box<Running>, Box<Outcome>> {
     let mut atoms = Strings::new();
     let program = match compiler::compile(&code, &mut atoms) {
         Ok(p) => p,
@@ -130,7 +130,7 @@ pub fn start<'a>(
         }
     };
     let setup = rt.setup();
-    let mut vm = Vm::new(RunHost::new(setup, run_id), setup.limits, atoms);
+    let mut vm = Vm::new(RunHost::new(setup.clone(), run_id), setup.limits, atoms);
     vm.setup();
     host::install(&mut vm, &program.globals);
     crate::builtins::ensure_globals(&mut vm, &program.globals);
@@ -141,21 +141,21 @@ pub fn start<'a>(
         vm.global_map.insert(a, val);
     }
     vm.load(program);
-    Ok(Box::new(Running::new(vm, code)))
+    Ok(Box::new(Running::new(vm, code.into_owned())))
 }
 
 /// A fresh run for a saved program: compiled and set up with the saved limits and no bindings, ready to be filled in.
-pub struct Resumed<'a> {
-    pub running: Box<Running<'a>>,
+pub struct Resumed {
+    pub running: Box<Running>,
     pub bytecode: String,
 }
 
-pub fn start_for_resume<'a>(
-    rt: &'a Runtime,
+pub fn start_for_resume(
+    rt: &Runtime,
     code: String,
     run_id: Option<String>,
     limits: crate::Limits,
-) -> Result<Resumed<'a>, crate::snapshot::SnapshotError> {
+) -> Result<Resumed, crate::snapshot::SnapshotError> {
     let mut atoms = Strings::new();
     let program = compiler::compile(&code, &mut atoms).map_err(|_| {
         crate::snapshot::SnapshotError::new(
@@ -163,15 +163,14 @@ pub fn start_for_resume<'a>(
         )
     })?;
     let bytecode = crate::snapshot::bytecode_hash(&program);
-    let setup = rt.setup();
-    let mut vm = Vm::new(RunHost::new(setup, run_id), limits, atoms);
+    let mut vm = Vm::new(RunHost::new(rt.setup().clone(), run_id), limits, atoms);
     vm.setup();
     host::install(&mut vm, &program.globals);
     crate::builtins::ensure_globals(&mut vm, &program.globals);
     vm.snapshot_base = crate::snapshot::Base::of(&vm);
     vm.load(program);
     Ok(Resumed {
-        running: Box::new(Running::new(vm, Cow::Owned(code))),
+        running: Box::new(Running::new(vm, code)),
         bytecode,
     })
 }
@@ -216,7 +215,7 @@ pub fn call_main(vm: &mut Vm) {
 }
 
 /// The outcome of a run that ended: host work it left running is interrupted, then the result is copied out.
-pub fn finish(r: Running<'_>) -> Outcome {
+pub fn finish(r: Running) -> Outcome {
     let Running { mut vm, code, .. } = r;
     let code: &str = &code;
     vm.host.tasks.clear();

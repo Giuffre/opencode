@@ -171,14 +171,14 @@ pub struct ResultRoot {
 }
 
 /// The host state of one run.
-pub struct RunHost<'rt> {
-    pub setup: &'rt Setup,
+pub struct RunHost {
+    pub setup: Arc<Setup>,
     /// Names the run's host calls; made on first use when the host gave none.
     pub(crate) run_id: crate::tool::RunId,
     pub(crate) next_call: u64,
     /// The context handed to synchronous tools, its call id set for each call.
     ctx: Option<ToolContext>,
-    pub tasks: Tasks<'rt, Settlement>,
+    pub tasks: Tasks<'static, Settlement>,
     pub(crate) functions: Vec<FnEntry>,
     /// Host calls in flight.
     pub calls: Vec<Call>,
@@ -218,7 +218,7 @@ pub(crate) struct Meter {
     pub counted: bool,
 }
 
-impl<'rt> RunHost<'rt> {
+impl RunHost {
     /// A point where the reference starts the calls queued so far: a new job, or a finished synchronous call.
     #[inline]
     pub fn next_epoch(&self) {
@@ -226,7 +226,7 @@ impl<'rt> RunHost<'rt> {
         self.epoch.store(self.epoch.load(Relaxed) + 1, Relaxed);
     }
 
-    pub fn new(setup: &'rt Setup, run_id: Option<String>) -> Self {
+    pub fn new(setup: Arc<Setup>, run_id: Option<String>) -> Self {
         Self {
             setup,
             ctx: None,
@@ -290,7 +290,7 @@ impl<'rt> RunHost<'rt> {
 
     /// Stops durable work still running when the run ends or is interrupted for real; a suspend detaches it first.
     pub fn cancel_durable(&mut self) {
-        let setup = self.setup;
+        let setup = self.setup.clone();
         for call in std::mem::take(&mut self.calls) {
             let CallKind::Durable(data) = &call.kind else {
                 continue;
@@ -318,7 +318,7 @@ impl<'rt> RunHost<'rt> {
     }
 }
 
-impl Drop for RunHost<'_> {
+impl Drop for RunHost {
     fn drop(&mut self) {
         self.cancel_durable();
     }
@@ -348,7 +348,7 @@ fn define_host_global(vm: &mut Vm, name: &str) -> bool {
         "require" => native(vm, "require", 1, require_native, Value::Undef),
         IMPORT_GLOBAL => native(vm, "import", 2, import_native, Value::Undef),
         _ => {
-            let setup = vm.host.setup;
+            let setup = vm.host.setup.clone();
             let found = setup.extensions.iter().find_map(|extension| {
                 extension
                     .globals()
@@ -394,16 +394,16 @@ pub fn call_tool(vm: &mut Vm, path: &str, args: &[Value]) -> Res {
 }
 
 /// Everything about a call that happens before its tool runs: the reference's `decode` and `admit`.
-struct Admitted<'rt> {
-    tool: &'rt Tool,
+struct Admitted {
+    tool: Arc<Tool>,
     input: Json,
     call: u64,
 }
 
 /// Starts a call whose promise is `p`, once its arguments have crossed (`args`, `None` for undefined). A call that ends
 /// at once queues its outcome; the rest become tasks.
-pub(crate) fn start_tool<'rt>(vm: &mut Vm<'rt>, p: Id, path: &str, args: Vec<Option<Json>>) {
-    let setup = vm.host.setup;
+pub(crate) fn start_tool(vm: &mut Vm, p: Id, path: &str, args: Vec<Option<Json>>) {
+    let setup = vm.host.setup.clone();
     // Models often write `tools.search(...)` for the bare `search(...)`; honor it unless a tool owns that path.
     if path == "search" && !setup.registry.exists("search") {
         let s = match run_search(vm, &args) {
@@ -429,7 +429,7 @@ pub(crate) fn start_tool<'rt>(vm: &mut Vm<'rt>, p: Id, path: &str, args: Vec<Opt
         shared.enter_sync(&vm.host, admitted.call, tool_expression(path));
         let raw = f(admitted.input, vm.host.sync_context(admitted.call));
         shared.leave_sync();
-        let s = finish(path, admitted.tool, raw);
+        let s = finish(path, &admitted.tool, raw);
         if let Settlement::Interrupted = s {
             interrupt(vm);
         }
@@ -456,17 +456,15 @@ pub enum Start {
 }
 
 /// Runs a tool call as a host future, recorded as in flight while it runs.
-pub fn spawn_tool<'rt>(
-    vm: &mut Vm<'rt>,
+pub fn spawn_tool(
+    vm: &mut Vm,
     p: Id,
     path: &str,
-    tool: &'rt Tool,
+    tool: Arc<Tool>,
     input: Json,
     call: u64,
     start: Start,
 ) {
-    let setup = vm.host.setup;
-    let hooks = &setup.hooks;
     let detached = Arc::new(AtomicBool::new(false));
     let kind = match &tool.execute {
         Execute::Idempotent(_) => CallKind::Idempotent,
@@ -487,7 +485,7 @@ pub fn spawn_tool<'rt>(
         call,
     };
     let future = Box::pin(hooked_tool(
-        hooks,
+        vm.host.setup.clone(),
         path.to_owned(),
         a,
         ctx,
@@ -510,16 +508,10 @@ pub fn spawn_tool<'rt>(
 }
 
 #[inline]
-fn admit<'rt>(
-    vm: &mut Vm<'rt>,
-    path: &str,
-    args: Vec<Option<Json>>,
-) -> Result<Admitted<'rt>, Box<Failed>> {
-    let setup = vm.host.setup;
-    let Some(tool) = setup.registry.get(path) else {
-        return Err(unknown_tool(setup, path));
+fn admit(vm: &mut Vm, path: &str, args: Vec<Option<Json>>) -> Result<Admitted, Box<Failed>> {
+    let Some(tool) = vm.host.setup.registry.get(path).cloned() else {
+        return Err(unknown_tool(&vm.host.setup, path));
     };
-    let tool: &'rt Tool = tool;
     let entry_field = if tool.freeform {
         schema::string_parameter(tool.input.document()).map(|(name, _)| name)
     } else {
@@ -643,14 +635,15 @@ impl Drop for AfterGuard<'_> {
 }
 
 async fn hooked_tool(
-    hooks: &Hooks,
+    setup: Arc<Setup>,
     name: String,
-    a: Admitted<'_>,
+    a: Admitted,
     ctx: ToolContext,
     detached: Arc<AtomicBool>,
     phase: Option<Arc<Mutex<Option<Json>>>>,
     start: Start,
 ) -> Settlement {
+    let hooks = &setup.hooks;
     let call = ToolInvocation {
         name: name.clone(),
         input: a.input.clone(),
@@ -692,7 +685,7 @@ async fn hooked_tool(
             }
         }
     };
-    let s = finish(&name, a.tool, raw);
+    let s = finish(&name, &a.tool, raw);
     guard.end(&s);
     s
 }
@@ -885,7 +878,7 @@ pub(crate) fn search_value(vm: &mut Vm, args: &[Option<Json>]) -> Res {
 
 /// The built-in search, blocking: decode, admit, the hooks, then the ranking.
 fn run_search(vm: &mut Vm, args: &[Option<Json>]) -> Result<Json, Box<Failed>> {
-    let setup = vm.host.setup;
+    let setup = vm.host.setup.clone();
     let mut args = args.to_vec();
     if let Some(Some(Json::String(query))) = args.first() {
         let mut map = serde_json::Map::new();
@@ -1482,7 +1475,7 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
             &mut seen,
         )?);
     }
-    let setup = vm.host.setup;
+    let setup = vm.host.setup.clone();
     let hooks = &setup.hooks;
     let invocation = hooked.then(|| ExtensionInvocation {
         extension,
@@ -1519,7 +1512,9 @@ fn extension_native(vm: &mut Vm, _this: Value, args: &[Value], callee: Id) -> Re
             let carrier = f.carrier;
             let call_id = vm.host.next_call();
             let path = label.clone();
-            let future: BoxFuture<'_, Settlement> = Box::pin(async move {
+            let setup = setup.clone();
+            let future: BoxFuture<'static, Settlement> = Box::pin(async move {
+                let hooks = &setup.hooks;
                 if let (Some(call), Some(before)) = (&invocation, &hooks.extension_before)
                     && let Err(e) = before(call).await
                 {

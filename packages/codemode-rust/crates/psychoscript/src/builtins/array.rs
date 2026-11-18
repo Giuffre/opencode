@@ -74,7 +74,7 @@ fn arr_id(vm: &mut Vm, this: &Value) -> Result<Id, Value> {
     Err(vm.type_error("Array.prototype method called on a value that is not an array"))
 }
 
-fn items<'a>(vm: &'a Vm, id: Id) -> &'a [Value] {
+fn items(vm: &Vm, id: Id) -> &[Value] {
     match &vm.heap[id as usize].kind {
         Kind::Array(items) => items,
         _ => &[],
@@ -170,7 +170,7 @@ fn inherited(vm: &mut Vm, id: Id, i: usize) -> Option<Value> {
 }
 
 /// The array's items for a mutating method, after `check_mutable`.
-fn items_mut<'a>(vm: &'a mut Vm, id: Id, growth: Option<i64>) -> Result<&'a mut Vec<Value>, Value> {
+fn items_mut(vm: &mut Vm, id: Id, growth: Option<i64>) -> Result<&mut Vec<Value>, Value> {
     check_mutable(vm, id, growth)?;
     array_items(vm, id)
 }
@@ -200,7 +200,7 @@ fn check_mutable(vm: &mut Vm, id: Id, growth: Option<i64>) -> Result<(), Value> 
     Ok(())
 }
 
-fn array_items<'a>(vm: &'a mut Vm, id: Id) -> Result<&'a mut Vec<Value>, Value> {
+fn array_items(vm: &mut Vm, id: Id) -> Result<&mut Vec<Value>, Value> {
     if !matches!(vm.heap[id as usize].kind, Kind::Array(_)) {
         return Err(vm.type_error("not an array"));
     }

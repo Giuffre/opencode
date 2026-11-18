@@ -124,7 +124,7 @@ fn this_bytes(vm: &mut Vm, this: &Value, name: &str) -> Result<Id, Value> {
     ))
 }
 
-pub fn bytes_ref<'a>(vm: &'a Vm, id: Id) -> &'a Bytes {
+pub fn bytes_ref(vm: &Vm, id: Id) -> &Bytes {
     match &vm.heap[id as usize].kind {
         Kind::Bytes(b) => b,
         _ => unreachable!("checked by this_bytes"),

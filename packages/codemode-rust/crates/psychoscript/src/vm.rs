@@ -220,7 +220,7 @@ pub struct Realm {
     pub std: crate::builtins::StdProtos,
 }
 
-pub struct Vm<'rt> {
+pub struct Vm {
     pub heap: Vec<Obj>,
     pub cells: Vec<Slot>,
     pub atoms: Strings,
@@ -248,7 +248,7 @@ pub struct Vm<'rt> {
     pub coroutines: Vec<Coroutine>,
     pub logs: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
-    pub host: crate::host::RunHost<'rt>,
+    pub host: crate::host::RunHost,
     pub tool_refs: FxHashMap<Arc<str>, Id>,
     pub limits: Limits,
     pub start: Instant,
@@ -292,8 +292,8 @@ pub struct Vm<'rt> {
     pub(crate) json_walk: u32,
     json_walks: u32,
     /// The code of every native frame (see `native.rs`).
-    pub(crate) native_proto: Rc<FuncProto>,
-    no_upvals: Rc<[u32]>,
+    pub(crate) native_proto: Arc<FuncProto>,
+    no_upvals: Arc<[u32]>,
     /// Set by a built-in that pushed a native frame instead of returning its result (`enter_native`).
     pub(crate) entered: bool,
     /// Set while a built-in called from bytecode or a convert frame's rerun runs: a conversion that calls the
@@ -306,8 +306,8 @@ pub struct Vm<'rt> {
     pub(crate) replay_meter: Option<crate::conversion::Meter>,
 }
 
-impl<'rt> Vm<'rt> {
-    pub fn new(host: crate::host::RunHost<'rt>, limits: Limits, atoms: Strings) -> Self {
+impl Vm {
+    pub fn new(host: crate::host::RunHost, limits: Limits, atoms: Strings) -> Self {
         let mut atoms = atoms;
         let names = Names {
             length: atoms.intern_static("length"),
@@ -385,8 +385,8 @@ impl<'rt> Vm<'rt> {
             resumable_run: false,
             snapshot_base: crate::snapshot::Base::default(),
             resumed: false,
-            native_proto: Rc::new(crate::native::proto()),
-            no_upvals: Rc::from([]),
+            native_proto: Arc::new(crate::native::proto()),
+            no_upvals: Arc::from([]),
             entered: false,
             convert_ok: false,
             convert_req: None,
@@ -1104,7 +1104,7 @@ impl<'rt> Vm<'rt> {
         match self.spare_frames.pop() {
             // Reuse a retired frame in place; one that ran a native frame keeps the shared code and no upvalues.
             Some(mut f) => {
-                if !Rc::ptr_eq(&f.func, &self.native_proto) {
+                if !Arc::ptr_eq(&f.func, &self.native_proto) {
                     f.func = self.native_proto.clone();
                 }
                 if !f.upvals.is_empty() {
