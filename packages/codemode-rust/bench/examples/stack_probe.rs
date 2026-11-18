@@ -120,8 +120,8 @@ fn main() {
         CONSTRUCTS.to_vec()
     };
     let (lo, hi) = match (run, cfg!(debug_assertions)) {
-        (true, true) => (10, 30),
-        (true, false) => (50, 150),
+        (true, true) => (500, 4500),
+        (true, false) => (500, 4500),
         _ => (200, 600),
     };
     for construct in constructs {
