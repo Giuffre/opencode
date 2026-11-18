@@ -1,7 +1,9 @@
-//! Moving a long run's compute off the thread that drives it. A run driven as a future that computes past
-//! [`OFFLOAD_AFTER`] without stopping continues its compute on a worker thread of its own. Host code stays where the
-//! run is driven: each tool call, extension call and first poll of a host future the worker meets is handed back and
-//! runs there while the worker waits, so host code runs on the same thread, in the same order, as before.
+//! Moving long stretches of a run's compute off the thread that drives it. A run driven as a future that computes
+//! past [`OFFLOAD_AFTER`] without stopping finishes that stretch on a worker thread of its own; the next stretch starts
+//! where the run is driven again. Host code stays there: each tool call, extension call and first poll of a host future
+//! the worker meets is handed back and runs there while the worker waits, so host code runs on the same thread, in the
+//! same order, as before. A handed-back call costs a few microseconds, which only stretches already past the budget
+//! pay.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};

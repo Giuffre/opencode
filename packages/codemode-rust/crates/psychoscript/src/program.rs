@@ -227,6 +227,8 @@ pub struct Program<'a> {
     /// Driven as a future, so a long stretch of compute moves to a worker thread instead of holding the executor's.
     offload: bool,
     worker: Option<offload::Worker>,
+    /// The stretch of compute in progress continues on the worker.
+    move_away: bool,
 }
 
 impl<'a> Program<'a> {
@@ -255,6 +257,7 @@ impl<'a> Program<'a> {
             shared,
             offload: false,
             worker: None,
+            move_away: false,
         }
     }
 
@@ -331,7 +334,7 @@ impl<'a> Program<'a> {
                 if r.vm.check_time().is_err() {
                     break;
                 }
-                if self.offload && self.worker.is_none() {
+                if self.offload {
                     r.vm.host.offload_at = Some(Instant::now() + offload::OFFLOAD_AFTER);
                 }
                 if !r.started {
@@ -354,9 +357,9 @@ impl<'a> Program<'a> {
                     }
                     r.vm.inbox.push_back((p, s));
                 }
-                let work =
-                    !r.vm.inbox.is_empty() || !r.vm.jobs.is_empty() || !r.vm.frames.is_empty();
-                if let Some(worker) = self.worker.as_ref().filter(|_| work) {
+                let away = std::mem::take(&mut self.move_away);
+                if let Some(worker) = self.worker.as_ref().filter(|_| away) {
+                    r.vm.host.offload_at = None;
                     let State::Running(r) = std::mem::replace(&mut self.state, State::Away) else {
                         unreachable!()
                     };
@@ -372,17 +375,19 @@ impl<'a> Program<'a> {
             if r.vm.outcome.is_some() || r.vm.fatal.is_some() {
                 break;
             }
-            // A stop to move only: it continues on the worker from here on. A suspend at the same stop goes first.
+            // A stop to move only: the stretch continues on the worker, and the next one starts here again. A suspend at
+            // the same stop goes first.
             if r.vm.suspended
                 && std::mem::take(&mut r.vm.host.offload_due)
                 && !self.shared.requested.load(Ordering::Relaxed)
             {
                 r.vm.suspended = false;
                 r.vm.suspend_wanted = false;
-                match offload::Worker::spawn() {
-                    Ok(worker) => self.worker = Some(worker),
-                    Err(_) => self.offload = false,
+                if self.worker.is_none() {
+                    self.worker = offload::Worker::spawn().ok();
                 }
+                self.move_away = self.worker.is_some();
+                self.offload = self.move_away;
                 continue;
             }
             if r.vm.suspended {
